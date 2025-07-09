@@ -1,0 +1,133 @@
+WITH prot_union AS (
+  SELECT 
+    prot.*,
+    prot."invoice" AS "match_id"
+  FROM "Protoinvoices" prot
+  WHERE prot."invoice" IS NOT NULL
+
+  UNION ALL
+
+  SELECT 
+    prot.*,
+    prot."prepaymentBill" AS "match_id"
+  FROM "Protoinvoices" prot
+  WHERE prot."invoice" IS NULL AND prot."prepaymentBill" IS NOT NULL
+),
+
+pbPaid_summary AS (
+  SELECT 
+    inv."id" AS "invoiceId",
+    SUM(pb."pbPaid") AS "prepaymentPaid"
+  FROM "Invoices" inv
+  LEFT JOIN "MoneyAllocations" ma ON ma."invoice" = inv."id" AND ma."state" <> 'deleted'
+  LEFT JOIN (
+    SELECT 
+      ma."payment" AS "paymentId",
+      SUM(ma."amount") AS "pbPaid"
+    FROM "MoneyAllocations" ma
+    LEFT JOIN "Payments" pay_1 ON pay_1."id" = ma."payment"
+    WHERE ma."state" <> 'deleted' 
+      AND (pay_1."state" <> 'deleted' OR ma."payment" IS NULL)
+      AND ma."prepaymentBill" IS NOT NULL
+    GROUP BY ma."payment"
+  ) pb ON pb."paymentId" = ma."payment"
+  WHERE inv."state" <> 'deleted'
+  GROUP BY inv."id"
+)
+
+
+SELECT 
+  ir."id",
+  MAX(ir."name") AS "invoiceName",
+  MAX(cou."name") AS "counterparty",
+  MAX(cou."externalId") AS "counterpartySap",
+  CASE 
+  	WHEN MAX(cou."_stdCounterpartyType") IS NOT null THEN MAX(cou."_stdCounterpartyType")
+  	ELSE 'TPP'
+  END AS "oppTpp",
+  MAX(ir."companyName") AS "company",
+  MAX(ir."source") AS "source",
+  CASE 
+    WHEN MAX(td."tradeName") IS NOT NULL THEN 'trade'
+    ELSE 'cost'
+  END AS "object",
+  MAX(ir."issueDate") AS "issueDate",
+  MAX(ir."dueDate") AS "dueDate",
+  MAX(ir."isIncoming") AS "isIncoming",
+  MAX(inv."isProvisional") AS "isProvisional",
+  MAX(ir."reference") AS "reference",
+  ROUND(MAX(ir."amount"), 2) AS "invAmount",
+  ROUND(MAX(ir."amountUSD"), 2) AS "invAmountUSD",
+  MAX(ir."currency") AS "currency",
+  MAX(ir."exchangeRate") AS "exchangeRate",
+  CASE 
+  	WHEN MAX(ir."isIncoming")='Y' THEN ROUND(MAX(COALESCE(inv_sum."invPaid", pre_sum."invPaid")),2)*-1
+  	ELSE ROUND(MAX(COALESCE(inv_sum."invPaid", pre_sum."invPaid")),2)
+  END AS "invPaid",
+  CASE
+  	WHEN MAX(ir."isIncoming")='Y' THEN ROUND(MAX(COALESCE(inv_sum."invPaid", pre_sum."invPaid")) * MAX(ir."exchangeRate"), 2)*-1
+  	ELSE ROUND(MAX(COALESCE(inv_sum."invPaid", pre_sum."invPaid")) * MAX(ir."exchangeRate"), 2)
+  END AS "invPaidUSD",
+  CASE 
+  	WHEN MAX(ir."isIncoming")='Y' THEN ROUND(MAX(ir."amount"), 2) - (ROUND(MAX(COALESCE(inv_sum."invPaid", pre_sum."invPaid", 0)), 2)*-1)
+  	ELSE ROUND(ROUND(MAX(ir."amount"), 2) - ROUND(MAX(COALESCE(inv_sum."invPaid", pre_sum."invPaid", 0)),2), 2)
+  END AS "outstandingBalance",
+  CASE 
+  	WHEN MAX(ir."isIncoming")='Y' THEN ROUND(MAX(ir."amount")*MAX(ir."exchangeRate"), 2) - (ROUND(MAX(COALESCE(inv_sum."invPaid", pre_sum."invPaid", 0))*MAX(ir."exchangeRate"), 2)*-1)
+  	ELSE ROUND(ROUND(MAX(ir."amount")*MAX(ir."exchangeRate"), 2) - ROUND(MAX(COALESCE(inv_sum."invPaid", pre_sum."invPaid", 0)),2)*MAX(ir."exchangeRate"), 2)
+  END AS "outstandingBalanceUsd",
+  MAX(COALESCE(pay_pre."payments",pre_sum."payments")) AS "payments",
+  MAX(pay_pre."prepayments") AS "prepayments",
+  MAX(pb."prepaymentPaid") AS "prepaymentPaid",
+  ROUND(MAX(pb."prepaymentPaid")*MAX(ir."exchangeRate"),2) AS "prepaymentPaidUsd",
+  CASE  
+    WHEN ROUND(MAX(ir."amount"), 2) = ROUND(MAX(COALESCE(inv_sum."invPaid", pre_sum."invPaid")), 2) AND MAX(ir."isIncoming") = 'N' THEN 'PAID'
+    WHEN ROUND(MAX(ir."amount"), 2) = ROUND(MAX(COALESCE(inv_sum."invPaid", pre_sum."invPaid")), 2)*-1 AND MAX(ir."isIncoming") = 'Y' THEN 'PAID'
+    WHEN ROUND(MAX(ir."amount"), 2) > ROUND(MAX(COALESCE(inv_sum."invPaid", pre_sum."invPaid")), 2) AND MAX(ir."isIncoming") = 'N' THEN 'PARTIALLY PAID'
+    WHEN ROUND(MAX(ir."amount"), 2) < ROUND(MAX(COALESCE(inv_sum."invPaid", pre_sum."invPaid")), 2)*-1 AND MAX(ir."isIncoming") = 'Y' THEN 'PARTIALLY PAID'
+    WHEN ROUND(MAX(ir."amount"), 2) < ROUND(MAX(COALESCE(inv_sum."invPaid", pre_sum."invPaid")), 2) AND MAX(ir."isIncoming") = 'N' THEN 'OVERPAYMENT'
+    WHEN ROUND(MAX(ir."amount"), 2) > ROUND(MAX(COALESCE(inv_sum."invPaid", pre_sum."invPaid")), 2)*-1 AND MAX(ir."isIncoming") = 'Y' THEN 'OVERPAYMENT'
+    WHEN MAX(COALESCE(inv_sum."invPaid", pre_sum."invPaid")) IS NULL THEN 'NO PAYMENT'
+  END AS "paymentStatus",
+  COALESCE(MAX(inv_sum."firstPaymentDate"), MAX(pre_sum."firstPaymentDate")) AS "firstPaymentDate",
+  COALESCE(MAX(inv_sum."lastPaymentDate"), MAX(pre_sum."lastPaymentDate")) AS "lastPaymentDate",
+  LISTAGG(DISTINCT td."tradeName", ' | ') WITHIN GROUP (ORDER BY ir."id") AS "tradeName",
+  LISTAGG(DISTINCT td."isSell", ' | ') WITHIN GROUP (ORDER BY ir."id") AS "isSell",
+  MAX(td_quantity."quantity") "quantitySum",
+  LISTAGG(DISTINCT td."creditTypeName", ' | ') WITHIN GROUP (ORDER BY ir."id") AS "creditType",
+  LISTAGG(DISTINCT td."titleEventName", ' | ') WITHIN GROUP (ORDER BY ir."id") AS "titleEvent",
+  LISTAGG(DISTINCT ei."name", ' | ') WITHIN GROUP (ORDER BY ir."id") AS "finalEvent",
+  LISTAGG(DISTINCT ei2."name", ' | ') WITHIN GROUP (ORDER BY ir."id") AS "provisionalEvent",
+  MIN(od."estimated") AS "f_eventDateEstimated",
+  MIN(od."actual") AS "f_eventDateActual",
+  MIN(od2."estimated") AS "p_eventDateEstimated",
+  MIN(od2."actual") AS "p_eventDateActual",
+  LISTAGG(DISTINCT td."p_paymentDescription", ' | ') WITHIN GROUP (ORDER BY ir."id") AS "p_paymentDescription",
+  LISTAGG(DISTINCT td."f_paymentDescription", ' | ') WITHIN GROUP (ORDER BY ir."id") AS "f_paymentDescription",
+  LISTAGG(DISTINCT td."productName", ' | ') WITHIN GROUP (ORDER BY ir."id") AS "productName",
+  LISTAGG(DISTINCT TO_CHAR(td."provisionalPriceUSD"), ' | ') WITHIN GROUP (ORDER BY ir."id") AS "provisionalPriceUSD",
+
+FROM "InvoicesReport" ir
+LEFT JOIN "Invoices" inv ON inv."id" = ir."id"
+LEFT JOIN prot_union prot ON prot."match_id" = ir."id"
+LEFT JOIN "CostsReport" cos ON cos."costId" = prot."cost" AND cos."state"<>'deleted'
+LEFT JOIN "Parcels" par ON par."id" = prot."fragment" AND par."state"<>'deleted'
+LEFT JOIN "TradesReport" td ON td."tradeId" = par."agTrade"
+LEFT JOIN "OperationalDates" od ON od."id"=par."id" AND od."eventItem"=td."f_finalPaymentEvent"
+LEFT JOIN "OperationalDates" od2 ON od2."id"=par."id" AND od2."eventItem"=td."p_provisionalPaymentEvent"
+LEFT JOIN "EventItems" ei ON ei."id"=td."f_finalPaymentEvent"
+LEFT JOIN "EventItems" ei2 ON ei2."id"=td."p_provisionalPaymentEvent"
+LEFT JOIN "Counterparties" cou ON cou."id" = ir."counterpartyId"
+LEFT JOIN pbPaid_summary pb ON pb."invoiceId"=ir."id"
+LEFT JOIN (
+    SELECT 
+        inv."id" AS "invoiceId",
+        SUM(ma."amount") "invPaid",
+        MIN(pay_1."valueDate") AS "firstPaymentDate",
+        MAX(pay_1."valueDate") AS "lastPaymentDate"
+    FROM "Invoices" inv
+    LEFT JOIN "MoneyAllocations" ma ON ma."invoice" = inv."id" AND ma."state" <> 'deleted'
+    LEFT JOIN "Payments" pay_1 ON pay_1."id" = ma."payment"
+    WHERE inv."state" <> 'deleted' AND (pay_1."state" <> 'deleted' OR ma."payment" IS NULL)
+    GROUP BY inv."id"
+) inv_sum ON ir."id" = inv_sum."invoiceId"
